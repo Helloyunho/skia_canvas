@@ -7,6 +7,28 @@
 
 extern sk_sp<skia::textlayout::FontCollection> fontCollection;
 
+void free_style(Style* style) {
+  if (style->shader != nullptr) {
+    style->shader->unref();
+  }
+}
+
+void free_font(Font* font) {
+  free(font->family);
+  free(font);
+}
+
+Style clone_style(Style* style) {
+  Style new_style;
+  new_style.type = style->type;
+  if (style->type == kStyleColor) {
+    new_style.color = style->color;
+  } else if (style->type == kStyleShader) {
+    new_style.shader = sk_sp(style->shader);
+  }
+  return new_style;
+}
+
 sk_context_state* create_default_state() {
   sk_context_state* state = new sk_context_state();
   state->paint = new SkPaint();
@@ -53,10 +75,8 @@ sk_context_state* clone_context_state(sk_context_state* state) {
   new_state->lineDash = state->lineDash;
   new_state->globalAlpha = state->globalAlpha;
   new_state->lineDashOffset = state->lineDashOffset;
-  new_state->fillStyle = state->fillStyle;
-  if (new_state->fillStyle.shader) new_state->fillStyle.shader = sk_sp(new_state->fillStyle.shader);
-  new_state->strokeStyle = state->strokeStyle;
-  if (new_state->strokeStyle.shader) new_state->strokeStyle.shader = sk_sp(new_state->strokeStyle.shader);
+  new_state->fillStyle = clone_style(&state->fillStyle);
+  new_state->strokeStyle = clone_style(&state->strokeStyle);
   new_state->shadowColor = state->shadowColor;
   new_state->transform = new SkMatrix(*state->transform);
   new_state->imageSmoothingEnabled = state->imageSmoothingEnabled;
@@ -78,12 +98,12 @@ sk_context_state* clone_context_state(sk_context_state* state) {
 }
 
 void free_context_state(sk_context_state* state) {
-  if (state->fillStyle.shader) state->fillStyle.shader.~sk_sp();
-  if (state->strokeStyle.shader) state->strokeStyle.shader.~sk_sp();
-  if (state->filter.get() != nullptr) state->filter.~sk_sp();
+  free_style(&state->fillStyle);
+  free_style(&state->strokeStyle);
+  if (state->filter.get() != nullptr) state->filter->unref();
   delete state->paint;
   delete state->transform;
-  free(state->font);
+  free_font(state->font);
 }
 
 // Utility
@@ -215,6 +235,7 @@ void applyShadowOffsetMatrix(sk_context* context) {
   shadowOffset->preTranslate(shadowOffsetX, shadowOffsetY);
   canvas->concat(*shadowOffset);
   canvas->concat(cts);
+  delete shadowOffset;
 }
 
 extern "C" {
@@ -242,8 +263,10 @@ extern "C" {
       applyShadowOffsetMatrix(context);
       canvas->drawRect(rect, *shadowPaint);
       canvas->restore();
+      delete shadowPaint;
     }
     canvas->drawRect(rect, *fillPaint);
+    delete fillPaint;
   }
 
   // Context.strokeRect()
@@ -257,8 +280,10 @@ extern "C" {
       applyShadowOffsetMatrix(context);
       canvas->drawRect(rect, *shadowPaint);
       canvas->restore();
+      delete shadowPaint;
     }
     canvas->drawRect(rect, *strokePaint);
+    delete strokePaint;
   }
 
   /// Drawing text
@@ -355,10 +380,10 @@ extern "C" {
     SkScalar baselineOffset = 0;
     switch (cssBaseline) {
     case CssBaseline::Top:
-      baselineOffset = -alphaBaseline - font_metrics.fAscent;
+      baselineOffset = -alphaBaseline - font_metrics.fAscent - font_metrics.fUnderlinePosition - font_metrics.fUnderlineThickness;
       break;
     case CssBaseline::Hanging:
-      baselineOffset = -alphaBaseline - (font_metrics.fAscent - font_metrics.fDescent) * 80 / 100.0;
+      baselineOffset = -alphaBaseline - font_metrics.fAscent * 80 / 100.0;
       break;
     case CssBaseline::Middle:
       baselineOffset = -paragraph->getHeight() / 2;
@@ -370,7 +395,27 @@ extern "C" {
       baselineOffset = -paragraph->getIdeographicBaseline();
       break;
     case CssBaseline::Bottom:
-      baselineOffset = -font_metrics.fStrikeoutPosition;
+      baselineOffset = font_metrics.fStrikeoutThickness + font_metrics.fStrikeoutPosition - alphaBaseline;
+      break;
+    }
+
+    auto line_center = lineWidth / 2.0f;
+    float paintX;
+    switch (context->state->textAlign) {
+    case TextAlign::kLeft:
+      paintX = x;
+      break;
+    case TextAlign::kCenter:
+      paintX = x - line_center;
+      break;
+    case TextAlign::kRight:
+      paintX = x - lineWidth;
+      break;
+    case TextAlign::kStart:
+      paintX = context->state->direction == TextDirection::kRTL ? x - lineWidth : x;
+      break;
+    case TextAlign::kEnd:
+      paintX = context->state->direction == TextDirection::kRTL ? x : x - lineWidth;
       break;
     }
 
@@ -378,38 +423,20 @@ extern "C" {
       auto offset = -baselineOffset - alphaBaseline;
       out_metrics->ascent = -ascent + offset;
       out_metrics->descent = descent + offset;
-      out_metrics->left = line_metrics.fLeft - firstCharBounds.fLeft;
-      out_metrics->right = lastCharPosX + lastCharBounds.fRight - line_metrics.fLeft;
+      out_metrics->left = -paintX + line_metrics.fLeft - firstCharBounds.fLeft;
+      out_metrics->right = paintX + lastCharPosX + lastCharBounds.fRight - line_metrics.fLeft;
       out_metrics->width = lineWidth;
       out_metrics->font_ascent = -font_metrics.fAscent + offset;
       out_metrics->font_descent = font_metrics.fDescent + offset;
     } else {
-      auto line_center = lineWidth / 2.0f;
-      float paintX;
-      switch (context->state->textAlign) {
-      case TextAlign::kLeft:
-        paintX = x;
-        break;
-      case TextAlign::kCenter:
-        paintX = x - line_center;
-        break;
-      case TextAlign::kRight:
-        paintX = x - lineWidth;
-        break;
-      case TextAlign::kStart:
-        paintX = context->state->direction == TextDirection::kRTL ? x - lineWidth : x;
-        break;
-      case TextAlign::kEnd:
-        paintX = context->state->direction == TextDirection::kRTL ? x : x - lineWidth;
-        break;
-      }
       auto needScale = lineWidth > maxWidth;
+      auto ratio = needScale ? maxWidth / lineWidth : 1.0;
       if (needScale) {
         context->canvas->save();
-        context->canvas->scale(maxWidth / lineWidth, 1.0);
+        context->canvas->scale(ratio, 1.0);
       }
       auto paintY = y + baselineOffset;
-      paragraph.get()->paint(context->canvas, paintX, paintY);
+      paragraph.get()->paint(context->canvas, paintX / ratio, paintY);
       if (needScale) {
         context->canvas->restore();
       }
@@ -446,10 +473,11 @@ extern "C" {
           shadowPaint
         );
         context->canvas->restore();
+        delete shadowPaint;
         if (res == 0) return 0;
       }
     }
-    return sk_context_text_base(
+    auto res = sk_context_text_base(
       context,
       text,
       textLen,
@@ -460,6 +488,8 @@ extern "C" {
       out_metrics,
       paint
     );
+    delete paint;
+    return res;
   }
 
   // Context.fillText() implementation in JS using sk_context_test
@@ -493,7 +523,6 @@ extern "C" {
 
   // Context.lineCap setter
   void sk_context_set_line_cap(sk_context* context, int cap) {
-    // std::cout << "setLineCap: " << context->state->paint << std::endl;
     switch (cap) {
       case 0:
         context->state->paint->setStrokeCap(SkPaint::kButt_Cap);
@@ -576,7 +605,7 @@ extern "C" {
     int variant,
     int stretch
   ) {
-    free(context->state->font);
+    free_font(context->state->font);
     context->state->font = new Font();
     context->state->font->family = strdup(family);
     context->state->font->size = size;
@@ -658,6 +687,7 @@ extern "C" {
   int sk_context_set_fill_style(sk_context* context, char* style) {
     auto color = CSSColorParser::parse(std::string(style));
     if (color) {
+      free_style(&context->state->fillStyle);
       auto val = color.value();
       context->state->fillStyle = Style();
       context->state->fillStyle.type = kStyleColor;
@@ -668,12 +698,14 @@ extern "C" {
   }
 
   void sk_context_set_fill_style_gradient(sk_context* context, sk_gradient* gradient) {
+    free_style(&context->state->fillStyle);
     context->state->fillStyle = Style();
     context->state->fillStyle.type = kStyleShader;
     context->state->fillStyle.shader = sk_gradient_to_shader(gradient, context->state->transform);
   }
 
   void sk_context_set_fill_style_pattern(sk_context* context, sk_pattern* pattern) {
+    free_style(&context->state->fillStyle);
     context->state->fillStyle = Style();
     context->state->fillStyle.type = kStyleShader;
     context->state->fillStyle.shader = sk_pattern_to_shader(pattern);
@@ -685,6 +717,7 @@ extern "C" {
   int sk_context_set_stroke_style(sk_context* context, char* style) {
     auto color = CSSColorParser::parse(std::string(style));
     if (color) {
+      free_style(&context->state->strokeStyle);
       auto val = color.value();
       context->state->strokeStyle = Style();
       context->state->strokeStyle.type = kStyleColor;
@@ -695,12 +728,14 @@ extern "C" {
   }
 
   void sk_context_set_stroke_style_gradient(sk_context* context, sk_gradient* gradient) {
+    free_style(&context->state->strokeStyle);
     context->state->strokeStyle = Style();
     context->state->strokeStyle.type = kStyleShader;
     context->state->strokeStyle.shader = sk_gradient_to_shader(gradient, context->state->transform);
   }
 
   void sk_context_set_stroke_style_pattern(sk_context* context, sk_pattern* pattern) {
+    free_style(&context->state->strokeStyle);
     context->state->strokeStyle = Style();
     context->state->strokeStyle.type = kStyleShader;
     context->state->strokeStyle.shader = sk_pattern_to_shader(pattern);
@@ -832,8 +867,10 @@ extern "C" {
       applyShadowOffsetMatrix(context);
       canvas->drawPath(*path, *shadowPaint);
       canvas->restore();
+      delete shadowPaint;
     }
     canvas->drawPath(*path, *paint);
+    delete paint;
   }
 
   // Context.stroke()
@@ -847,8 +884,10 @@ extern "C" {
       applyShadowOffsetMatrix(context);
       canvas->drawPath(*path, *shadowPaint);
       canvas->restore();
+      delete shadowPaint;
     }
     canvas->drawPath(*path, *strokePaint);
+    delete strokePaint;
   }
 
   // TODO?: Context.drawFocusIfNeeded() (should we support it?)
@@ -940,7 +979,6 @@ extern "C" {
     ts->setAll(a, b, e, c, d, f, 0.0f, 0.0f, 1.0f);
     s->transform = ts;
     context->canvas->setMatrix(*s->transform);
-    delete ts;
   }
 
   // Context.resetTransform()
@@ -1082,6 +1120,7 @@ extern "C" {
         shadowPaint,
         SkCanvas::kFast_SrcRectConstraint
       );
+      delete shadowPaint;
     }
 
     context->canvas->drawImageRect(
@@ -1176,6 +1215,7 @@ extern "C" {
   /// Filters
   
   void sk_context_filter_reset(sk_context* context) {
+    if (context->state->filter.get() != nullptr) context->state->filter->unref();
     context->state->filter = sk_sp((SkImageFilter*) nullptr);
   }
 
